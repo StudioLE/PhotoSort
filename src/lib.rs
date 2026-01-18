@@ -32,12 +32,16 @@ pub mod name;
 /// * `OnlyName` - Represents the action of analyzing a file based only on its name.
 /// * `EmbeddedThenName` - Represents the action of analyzing a file based first on its Exif data/Video metadata, then on its name if the Exif data/Video metadata is not sufficient.
 /// * `NameThenEmbedded` - Represents the action of analyzing a file based first on its name, then on its Exif data/Video metadata if the name is not sufficient.
+/// * `EmbeddedThenNameThenFs` - Like `EmbeddedThenName`, but falls back to the file's filesystem date if neither Exif data/Video metadata nor name analysis yields a date.
+/// * `NameThenEmbeddedThenFs` - Like `NameThenEmbedded`, but falls back to the file's filesystem date if neither name nor Exif data/Video metadata analysis yields a date.
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub enum AnalysisType {
     OnlyEmbedded,
     OnlyName,
     EmbeddedThenName,
     NameThenEmbedded,
+    EmbeddedThenNameThenFs,
+    NameThenEmbeddedThenFs,
 }
 /// Implementation of the `FromStr` trait for `AnalysisType`.
 ///
@@ -63,6 +67,8 @@ impl FromStr for AnalysisType {
             | "en" => Ok(AnalysisType::EmbeddedThenName),
             "name_then_exif" | "name_exif" | "name_then_embedded" | "name_then_metadata" | "nm"
             | "ne" => Ok(AnalysisType::NameThenEmbedded),
+            "exif_then_name_then_fs" | "exif_name_fs" => Ok(AnalysisType::EmbeddedThenNameThenFs),
+            "name_then_exif_then_fs" | "name_exif_fs" => Ok(AnalysisType::NameThenEmbeddedThenFs),
             _ => Err(anyhow::anyhow!("Invalid analysis type")),
         }
     }
@@ -234,6 +240,11 @@ impl Analyzer {
         Ok(video_time)
     }
 
+    fn analyze_fs<P: AsRef<Path>>(path: P) -> Result<Option<NaiveDateTime>> {
+        let fs_time = analysis::fs2date::get_file_modified_time(path)?;
+        Ok(fs_time)
+    }
+
     fn analyze_embedded_metadata<A: AsRef<Path>>(&self, path: A) -> Result<Option<NaiveDateTime>> {
         let path = path.as_ref();
 
@@ -295,7 +306,7 @@ impl Analyzer {
             return Err(anyhow::anyhow!("Invalid file extension"));
         }
 
-        Ok(match self.settings.analysis_type {
+        let result = match self.settings.analysis_type {
             AnalysisType::OnlyEmbedded => {
                 let exif_result = self
                     .analyze_embedded_metadata(path)
@@ -308,7 +319,7 @@ impl Analyzer {
                 }
             }
             AnalysisType::OnlyName => self.analyze_name(name)?,
-            AnalysisType::EmbeddedThenName => {
+            AnalysisType::EmbeddedThenName | AnalysisType::EmbeddedThenNameThenFs => {
                 let metadata_result = self.analyze_embedded_metadata(path);
                 let exif_result = match metadata_result {
                     Err(e) => {
@@ -332,15 +343,45 @@ impl Analyzer {
                     None => name_result?,
                 }
             }
-            AnalysisType::NameThenEmbedded => {
+            AnalysisType::NameThenEmbedded | AnalysisType::NameThenEmbeddedThenFs => {
                 let name_result = self.analyze_name(name)?;
                 if name_result.0.is_none() {
-                    (self.analyze_embedded_metadata(path)?, name_result.1)
+                    let metadata_result = self.analyze_embedded_metadata(path);
+                    match metadata_result {
+                        Ok(date) => (date, name_result.1),
+                        Err(e) => {
+                            warn!(
+                                "Error analyzing embedded data: {} for {}",
+                                e,
+                                path.display()
+                            );
+                            (None, name_result.1)
+                        }
+                    }
                 } else {
                     name_result
                 }
             }
-        })
+        };
+
+        let uses_fs_fallback = matches!(
+            self.settings.analysis_type,
+            AnalysisType::EmbeddedThenNameThenFs | AnalysisType::NameThenEmbeddedThenFs
+        );
+        if result.0.is_none() && uses_fs_fallback {
+            info!("Falling back to filesystem date for {}", path.display());
+            match Self::analyze_fs(path) {
+                Ok(date) => return Ok((date, result.1)),
+                Err(e) => {
+                    warn!(
+                        "Error getting filesystem date: {} for {}",
+                        e,
+                        path.display()
+                    );
+                }
+            }
+        }
+        Ok(result)
     }
 
     /// Replaces {name}, {date}, ... in a format with actual values
@@ -1091,7 +1132,9 @@ mod tests {
 
         // Act
         let mut files = Vec::new();
-        analyzer.find_files_in_source(source_dir, false, &mut files).unwrap();
+        analyzer
+            .find_files_in_source(source_dir, false, &mut files)
+            .unwrap();
         for file in files {
             analyzer.run_file(&file, &None).unwrap();
         }
@@ -1215,7 +1258,9 @@ mod tests {
 
         // Act
         let mut files = Vec::new();
-        analyzer.find_files_in_source(source_dir, false, &mut files).unwrap();
+        analyzer
+            .find_files_in_source(source_dir, false, &mut files)
+            .unwrap();
         for file in files {
             analyzer.run_file(&file, &None).unwrap();
         }
@@ -1255,7 +1300,9 @@ mod tests {
 
         // Act
         let mut files = Vec::new();
-        analyzer.find_files_in_source(source_dir, false, &mut files).unwrap();
+        analyzer
+            .find_files_in_source(source_dir, false, &mut files)
+            .unwrap();
         for file in files {
             analyzer.run_file(&file, &None).unwrap();
         }
@@ -1303,7 +1350,9 @@ mod tests {
 
         // Act
         let mut files = Vec::new();
-        analyzer.find_files_in_source(source_dir, false, &mut files).unwrap();
+        analyzer
+            .find_files_in_source(source_dir, false, &mut files)
+            .unwrap();
         for file in files {
             analyzer.run_file(&file, &None).unwrap();
         }
@@ -1339,7 +1388,9 @@ mod tests {
 
         // Act
         let mut files = Vec::new();
-        analyzer.find_files_in_source(source_dir, false, &mut files).unwrap();
+        analyzer
+            .find_files_in_source(source_dir, false, &mut files)
+            .unwrap();
         for file in files {
             analyzer.run_file(&file, &None).unwrap();
         }
@@ -1462,6 +1513,161 @@ mod tests {
     }
 
     // ============================================================================
+    // AnalysisType parsing tests
+    // ============================================================================
+
+    #[test]
+    fn test_analysis_type_from_str_fs_fallback_modes() {
+        // Test parsing of the new fs fallback analysis modes
+        assert_eq!(
+            AnalysisType::from_str("exif_then_name_then_fs").unwrap(),
+            AnalysisType::EmbeddedThenNameThenFs
+        );
+        assert_eq!(
+            AnalysisType::from_str("exif_name_fs").unwrap(),
+            AnalysisType::EmbeddedThenNameThenFs
+        );
+        assert_eq!(
+            AnalysisType::from_str("name_then_exif_then_fs").unwrap(),
+            AnalysisType::NameThenEmbeddedThenFs
+        );
+        assert_eq!(
+            AnalysisType::from_str("name_exif_fs").unwrap(),
+            AnalysisType::NameThenEmbeddedThenFs
+        );
+        // Test case insensitivity
+        assert_eq!(
+            AnalysisType::from_str("EXIF_THEN_NAME_THEN_FS").unwrap(),
+            AnalysisType::EmbeddedThenNameThenFs
+        );
+    }
+
+    // ============================================================================
+    // Filesystem date fallback tests
+    // ============================================================================
+
+    #[test]
+    fn test_exif_then_name_then_fs_uses_filesystem_date() {
+        // Arrange - file with no EXIF and no date in filename should fall back to fs date
+        let (_temp_dir, source_dir, target_dir) = setup_test_dirs().unwrap();
+        let no_date_file = TestImageBuilder::new()
+            .jpeg()
+            .with_directory(&source_dir)
+            .with_filename("random_photo.jpg")
+            .build()
+            .unwrap();
+        let analyzer = create_analyzer(
+            vec![source_dir],
+            target_dir.clone(),
+            AnalysisType::EmbeddedThenNameThenFs,
+            ActionMode::Execute(ActualAction::Copy),
+        );
+
+        // Act
+        analyzer.run_file(&no_date_file, &None).unwrap();
+
+        // Assert - file should NOT be in nodate folder since fs date is used
+        let nodate_dir = target_dir.join("nodate");
+        let nodate_has_files = nodate_dir.exists()
+            && fs::read_dir(&nodate_dir)
+                .map(|rd| rd.count() > 0)
+                .unwrap_or(false);
+        assert!(
+            !nodate_has_files,
+            "File should be sorted by filesystem date, not placed in nodate"
+        );
+    }
+
+    #[test]
+    fn test_name_then_exif_then_fs_uses_filesystem_date() {
+        // Arrange - file with no date in filename and no EXIF should fall back to fs date
+        // Use PNG since it doesn't have EXIF, avoiding the EXIF parsing error
+        let (_temp_dir, source_dir, target_dir) = setup_test_dirs().unwrap();
+        let no_date_file = TestImageBuilder::new()
+            .png()
+            .with_directory(&source_dir)
+            .with_filename("screenshot.png")
+            .build()
+            .unwrap();
+        let analyzer = create_analyzer(
+            vec![source_dir],
+            target_dir.clone(),
+            AnalysisType::NameThenEmbeddedThenFs,
+            ActionMode::Execute(ActualAction::Copy),
+        );
+
+        // Act
+        analyzer.run_file(&no_date_file, &None).unwrap();
+
+        // Assert - file should NOT be in nodate folder since fs date is used
+        let nodate_dir = target_dir.join("nodate");
+        let nodate_has_files = nodate_dir.exists()
+            && fs::read_dir(&nodate_dir)
+                .map(|rd| rd.count() > 0)
+                .unwrap_or(false);
+        assert!(
+            !nodate_has_files,
+            "File should be sorted by filesystem date, not placed in nodate"
+        );
+    }
+
+    #[test]
+    fn test_exif_then_name_then_fs_prefers_exif() {
+        // Arrange - file with EXIF date should use EXIF, not fall back to fs
+        let (_temp_dir, source_dir, target_dir) = setup_test_dirs().unwrap();
+        let exif_date = get_datetime(2024, 3, 15, 10, 30, 0);
+        let with_exif = TestImageBuilder::new()
+            .jpeg()
+            .with_exif_datetime(exif_date)
+            .with_directory(&source_dir)
+            .with_filename("photo.jpg")
+            .build()
+            .unwrap();
+        let analyzer = create_analyzer(
+            vec![source_dir],
+            target_dir.clone(),
+            AnalysisType::EmbeddedThenNameThenFs,
+            ActionMode::Execute(ActualAction::Copy),
+        );
+
+        // Act
+        analyzer.run_file(&with_exif, &None).unwrap();
+
+        // Assert - should be sorted by EXIF date (March 2024)
+        assert!(
+            target_dir.join("2024/03").exists(),
+            "File should be sorted by EXIF date to 2024/03"
+        );
+    }
+
+    #[test]
+    fn test_name_then_exif_then_fs_prefers_name() {
+        // Arrange - file with date in filename should use that, not fall back
+        let (_temp_dir, source_dir, target_dir) = setup_test_dirs().unwrap();
+        let source_file = TestImageBuilder::new()
+            .jpeg()
+            .with_directory(&source_dir)
+            .with_filename("20241225_christmas.jpg")
+            .build()
+            .unwrap();
+        let analyzer = create_analyzer(
+            vec![source_dir],
+            target_dir.clone(),
+            AnalysisType::NameThenEmbeddedThenFs,
+            ActionMode::Execute(ActualAction::Copy),
+        );
+
+        // Act
+        analyzer.run_file(&source_file, &None).unwrap();
+
+        // Assert - should be sorted by filename date (December 2024)
+        assert!(
+            target_dir.join("2024/12").exists(),
+            "File should be sorted by filename date to 2024/12"
+        );
+    }
+
+    // ============================================================================
     // Deduplication tests
     // ============================================================================
 
@@ -1488,7 +1694,9 @@ mod tests {
 
         // Act
         let mut files = Vec::new();
-        analyzer.find_files_in_source(source_dir, false, &mut files).unwrap();
+        analyzer
+            .find_files_in_source(source_dir, false, &mut files)
+            .unwrap();
         for file in files {
             analyzer.run_file(&file, &None).unwrap();
         }
@@ -1550,7 +1758,9 @@ mod tests {
 
         // Act
         let mut files = Vec::new();
-        analyzer.find_files_in_source(source_dir, true, &mut files).unwrap();
+        analyzer
+            .find_files_in_source(source_dir, true, &mut files)
+            .unwrap();
         assert_eq!(files.len(), 3, "Should find 3 files recursively");
         for file in files {
             analyzer.run_file(&file, &None).unwrap();
@@ -1703,7 +1913,9 @@ mod tests {
         // Act
         for source in [source1, source2] {
             let mut files = Vec::new();
-            analyzer.find_files_in_source(source, false, &mut files).unwrap();
+            analyzer
+                .find_files_in_source(source, false, &mut files)
+                .unwrap();
             for file in files {
                 analyzer.run_file(&file, &None).unwrap();
             }
@@ -1902,7 +2114,9 @@ mod tests {
             );
 
             let mut files = Vec::new();
-            analyzer.find_files_in_source(source_dir, false, &mut files).unwrap();
+            analyzer
+                .find_files_in_source(source_dir, false, &mut files)
+                .unwrap();
             for file in files {
                 analyzer.run_file(&file, &None).unwrap();
             }
@@ -1940,7 +2154,9 @@ mod tests {
 
             // Act
             let mut files = Vec::new();
-            analyzer.find_files_in_source(source_dir, false, &mut files).unwrap();
+            analyzer
+                .find_files_in_source(source_dir, false, &mut files)
+                .unwrap();
             for file in files {
                 analyzer.run_file(&file, &None).unwrap();
             }
