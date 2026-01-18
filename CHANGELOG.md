@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- expanded default image extensions to include RAW formats and XMP sidecar files:
+  - cr2, cr3 ([Canon RAW](https://www.usa.canon.com/learning/training-articles/training-articles-list/raw-image-fundamentals))
+  - nef ([Nikon RAW](https://imaging.nikon.com/imaging/lineup/software/nx_studio/))
+  - arw ([Sony RAW](https://helpguide.sony.net/ilc/2230/v1/en/contents/TP0003057049.html))
+  - raf ([Fujifilm RAW](https://www.fujifilm-x.com/global/support/download/software/raw-file-converter-ex-powered-by-silkypix/))
+  - orf ([Olympus RAW](https://learnandsupport.getolympus.com/learn-center/photography-tips/basics-of-photography/why-shoot-in-raw))
+  - rw2 ([Panasonic RAW](https://av.jpn.support.panasonic.com/support/global/cs/dsc/download/raw/))
+  - dng ([Adobe Digital Negative](https://helpx.adobe.com/camera-raw/digital-negative.html))
+  - xmp ([Adobe XMP sidecar](https://developer.adobe.com/xmp/docs/XMPSpecifications/))
+- expanded default video extensions to include:
+  - mkv ([Matroska](https://www.matroska.org/))
+  - webm ([WebM Project](https://www.webmproject.org/about/))
+
 ## [0.2.11](https://github.com/0xCCF4/PhotoSort/compare/v0.2.10...v0.2.11) - 2025-10-14
 
 ### Added

@@ -703,15 +703,10 @@ mod tests {
     use std::fs;
     use std::path::PathBuf;
 
-    /// Creates a standard analyzer with common settings for testing
-    fn create_analyzer(
-        source_dirs: Vec<PathBuf>,
-        target_dir: PathBuf,
-        analysis_type: AnalysisType,
-        action_mode: ActionMode,
-    ) -> Analyzer {
-        let settings = AnalyzerSettings {
-            analysis_type,
+    /// Creates default analyzer settings for testing
+    fn default_test_settings(source_dirs: Vec<PathBuf>, target_dir: PathBuf) -> AnalyzerSettings {
+        AnalyzerSettings {
+            analysis_type: AnalysisType::OnlyExif,
             exif_date_type: ExifDateType::Creation,
             source_dirs,
             target_dir,
@@ -727,15 +722,38 @@ mod tests {
                 "jpeg".to_string(),
                 "png".to_string(),
                 "cr2".to_string(),
+                "cr3".to_string(),
                 "nef".to_string(),
                 "arw".to_string(),
+                "raf".to_string(),
+                "orf".to_string(),
+                "rw2".to_string(),
                 "dng".to_string(),
+                "xmp".to_string(),
             ],
             #[cfg(feature = "video")]
-            video_extensions: vec!["mp4".to_string(), "mov".to_string(), "avi".to_string()],
-            action_type: action_mode,
+            video_extensions: vec![
+                "mp4".to_string(),
+                "mov".to_string(),
+                "avi".to_string(),
+                "mkv".to_string(),
+                "webm".to_string(),
+            ],
+            action_type: ActionMode::Execute(ActualAction::Copy),
             mkdir: true,
-        };
+        }
+    }
+
+    /// Creates a standard analyzer with common settings for testing
+    fn create_analyzer(
+        source_dirs: Vec<PathBuf>,
+        target_dir: PathBuf,
+        analysis_type: AnalysisType,
+        action_mode: ActionMode,
+    ) -> Analyzer {
+        let mut settings = default_test_settings(source_dirs, target_dir);
+        settings.analysis_type = analysis_type;
+        settings.action_type = action_mode;
 
         let mut analyzer = Analyzer::new(settings).expect("Failed to create analyzer");
 
@@ -994,6 +1012,88 @@ mod tests {
                 dir_path.display()
             );
         }
+    }
+
+    #[test]
+    fn test_additional_raw_formats() {
+        // Arrange - test the newly added RAW formats: cr3, raf, orf, rw2
+        let (_temp_dir, source_dir, target_dir) = setup_test_dirs().unwrap();
+        let raw_files = [
+            ("20240501_canon_r5.cr3", "2024/05"),
+            ("20240602_fuji_xt5.raf", "2024/06"),
+            ("20240703_olympus.orf", "2024/07"),
+            ("20240804_panasonic.rw2", "2024/08"),
+        ];
+        for (filename, _) in &raw_files {
+            TestFileBuilder::new()
+                .raw()
+                .with_directory(&source_dir)
+                .with_filename(filename)
+                .build()
+                .unwrap();
+        }
+        let analyzer = create_analyzer(
+            vec![source_dir.clone()],
+            target_dir.clone(),
+            AnalysisType::OnlyName,
+            ActionMode::Execute(ActualAction::Copy),
+        );
+
+        // Act
+        let mut files = Vec::new();
+        find_files_in_source(source_dir, false, &mut files).unwrap();
+        for file in files {
+            analyzer.run_file(&file, &None).unwrap();
+        }
+
+        // Assert
+        for (_, expected_dir) in &raw_files {
+            let dir_path = target_dir.join(expected_dir);
+            assert!(
+                dir_path.exists(),
+                "Expected directory: {}",
+                dir_path.display()
+            );
+        }
+    }
+
+    #[test]
+    fn test_xmp_sidecar_file_handling() {
+        // Arrange - XMP sidecar files should be processed
+        let (_temp_dir, source_dir, target_dir) = setup_test_dirs().unwrap();
+        TestFileBuilder::new()
+            .raw()
+            .with_directory(&source_dir)
+            .with_filename("20240915_photo.xmp")
+            .with_content(b"<?xml version=\"1.0\"?><x:xmpmeta></x:xmpmeta>")
+            .build()
+            .unwrap();
+        let analyzer = create_analyzer(
+            vec![source_dir.clone()],
+            target_dir.clone(),
+            AnalysisType::OnlyName,
+            ActionMode::Execute(ActualAction::Copy),
+        );
+
+        // Act
+        let mut files = Vec::new();
+        find_files_in_source(source_dir, false, &mut files).unwrap();
+        for file in files {
+            analyzer.run_file(&file, &None).unwrap();
+        }
+
+        // Assert
+        let expected_dir = target_dir.join("2024/09");
+        assert!(
+            expected_dir.exists(),
+            "XMP file should be sorted to {}",
+            expected_dir.display()
+        );
+        let has_xmp = fs::read_dir(&expected_dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .any(|f| f.path().extension().map_or(false, |e| e == "xmp"));
+        assert!(has_xmp, "Directory should contain the .xmp file");
     }
 
     // ============================================================================
@@ -1526,30 +1626,12 @@ mod tests {
                     .unwrap();
             }
 
-            let settings = AnalyzerSettings {
-                analysis_type: AnalysisType::OnlyName,
-                exif_date_type: ExifDateType::Creation,
-                source_dirs: vec![source_dir.clone()],
-                target_dir: target_dir.clone(),
-                recursive_source: false,
-                file_format: "{date?%Y}/{date?%m}/{type}{_:date}{-:name}.{ext?lower}".to_string(),
-                nodate_file_format: "nodate/{type}{-:name}.{ext?lower}".to_string(),
-                unknown_file_format: None,
-                bracketed_file_format: None,
-                date_format: "%Y%m%d-%H%M%S".to_string(),
-                extensions: vec!["jpg".to_string()],
-                video_extensions: vec!["mp4".to_string(), "mov".to_string(), "avi".to_string()],
-                action_type: ActionMode::Execute(ActualAction::Copy),
-                mkdir: true,
-            };
-
-            let mut analyzer = Analyzer::new(settings).unwrap();
-            analyzer.add_transformer(NaiveFileNameParser::default());
-            analyzer.add_formatter(FormatDate::default());
-            analyzer.add_formatter(FormatName::default());
-            analyzer.add_formatter(FormatDuplicate::default());
-            analyzer.add_formatter(FormatExtension::default());
-            analyzer.add_formatter(FormatFileType::default());
+            let analyzer = create_analyzer(
+                vec![source_dir.clone()],
+                target_dir.clone(),
+                AnalysisType::OnlyName,
+                ActionMode::Execute(ActualAction::Copy),
+            );
 
             let mut files = Vec::new();
             find_files_in_source(source_dir, false, &mut files).unwrap();
@@ -1561,6 +1643,49 @@ mod tests {
             assert!(target_dir.join("2024/01").exists());
             assert!(target_dir.join("2024/02").exists());
             assert!(target_dir.join("2024/07").exists());
+        }
+
+        #[test]
+        fn test_mkv_webm_video_sorting() {
+            // Arrange - test the newly added video formats: mkv, webm
+            let (_temp_dir, source_dir, target_dir) = setup_test_dirs().unwrap();
+            let video_files = [
+                ("20240810_screen_recording.mkv", "2024/08"),
+                ("20240920_webinar.webm", "2024/09"),
+            ];
+
+            for (filename, _) in &video_files {
+                TestFileBuilder::new()
+                    .video()
+                    .with_directory(&source_dir)
+                    .with_filename(filename)
+                    .build()
+                    .unwrap();
+            }
+
+            let analyzer = create_analyzer(
+                vec![source_dir.clone()],
+                target_dir.clone(),
+                AnalysisType::OnlyName,
+                ActionMode::Execute(ActualAction::Copy),
+            );
+
+            // Act
+            let mut files = Vec::new();
+            find_files_in_source(source_dir, false, &mut files).unwrap();
+            for file in files {
+                analyzer.run_file(&file, &None).unwrap();
+            }
+
+            // Assert
+            for (_, expected_dir) in &video_files {
+                let dir_path = target_dir.join(expected_dir);
+                assert!(
+                    dir_path.exists(),
+                    "Expected directory: {}",
+                    dir_path.display()
+                );
+            }
         }
     }
 

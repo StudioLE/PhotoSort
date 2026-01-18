@@ -85,11 +85,11 @@ struct Arguments {
     #[arg(long, default_value = "false", alias = "mkdirs")]
     mkdir: bool,
     /// A comma separated list of file extensions to include in the analysis.
-    #[arg(short, long, alias= "ext", default_value = "jpg,jpeg,png,tiff,heif,heic,avif,webp", value_delimiter = ',', num_args = 0..)]
+    #[arg(short, long, alias= "ext", default_value = "jpg,jpeg,png,tiff,heif,heic,avif,webp,cr2,cr3,nef,arw,raf,orf,rw2,dng,xmp", value_delimiter = ',', num_args = 0..)]
     extensions: Vec<String>,
     #[cfg(feature = "video")]
     /// A comma separated list of video extensions to include in the analysis.
-    #[arg(long, default_value = "mp4,mov,avi", value_delimiter = ',', num_args = 0..)]
+    #[arg(long, default_value = "mp4,mov,avi,mkv,webm", value_delimiter = ',', num_args = 0..)]
     video_extensions: Vec<String>,
     /// The sorting mode, possible values are `name_then_exif`, `exif_then_name`, `only_name`, `only_exif`.
     /// Name analysis tries to extract the date from the file name, Exif analysis tries to extract the date from the EXIF data.
