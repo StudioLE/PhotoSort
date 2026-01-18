@@ -21,6 +21,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - expanded default video extensions to include:
   - mkv ([Matroska](https://www.matroska.org/))
   - webm ([WebM Project](https://www.webmproject.org/about/))
+- added `exif_then_name_then_fs` and `name_then_exif_then_fs` analysis modes that fall back to the file's filesystem modification date when no date can be extracted from metadata or filename (useful for MKV files and screenshots that lack embedded metadata)
 
 ## [0.2.11](https://github.com/0xCCF4/PhotoSort/compare/v0.2.10...v0.2.11) - 2025-10-14
 
