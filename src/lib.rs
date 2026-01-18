@@ -28,12 +28,16 @@ pub mod name;
 /// * `OnlyName` - Represents the action of analyzing a file based only on its name.
 /// * `ExifThenName` - Represents the action of analyzing a file based first on its Exif data, then on its name if the Exif data is not sufficient.
 /// * `NameThenExif` - Represents the action of analyzing a file based first on its name, then on its Exif data if the name is not sufficient.
+/// * `ExifThenNameThenFs` - Like `ExifThenName`, but falls back to the file's filesystem date if neither Exif nor name analysis yields a date.
+/// * `NameThenExifThenFs` - Like `NameThenExif`, but falls back to the file's filesystem date if neither name nor Exif analysis yields a date.
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub enum AnalysisType {
     OnlyExif,
     OnlyName,
     ExifThenName,
     NameThenExif,
+    ExifThenNameThenFs,
+    NameThenExifThenFs,
 }
 /// Implementation of the `FromStr` trait for `AnalysisType`.
 ///
@@ -55,6 +59,8 @@ impl FromStr for AnalysisType {
             "only_name" | "name" => Ok(AnalysisType::OnlyName),
             "exif_then_name" | "exif_name" => Ok(AnalysisType::ExifThenName),
             "name_then_exif" | "name_exif" => Ok(AnalysisType::NameThenExif),
+            "exif_then_name_then_fs" | "exif_name_fs" => Ok(AnalysisType::ExifThenNameThenFs),
+            "name_then_exif_then_fs" | "name_exif_fs" => Ok(AnalysisType::NameThenExifThenFs),
             _ => Err(anyhow::anyhow!("Invalid analysis type")),
         }
     }
@@ -217,6 +223,11 @@ impl Analyzer {
         Ok(video_time)
     }
 
+    fn analyze_fs<P: AsRef<Path>>(path: P) -> Result<Option<NaiveDateTime>> {
+        let fs_time = analysis::fs2date::get_file_modified_time(path)?;
+        Ok(fs_time)
+    }
+
     fn analyze_exif<A: AsRef<Path>>(&self, path: A) -> Result<Option<NaiveDateTime>> {
         let path = path.as_ref();
 
@@ -278,7 +289,7 @@ impl Analyzer {
             return Err(anyhow::anyhow!("Invalid file extension"));
         }
 
-        Ok(match self.settings.analysis_type {
+        let result = match self.settings.analysis_type {
             AnalysisType::OnlyExif => {
                 let exif_result = self
                     .analyze_exif(path)
@@ -291,7 +302,7 @@ impl Analyzer {
                 }
             }
             AnalysisType::OnlyName => self.analyze_name(name)?,
-            AnalysisType::ExifThenName => {
+            AnalysisType::ExifThenName | AnalysisType::ExifThenNameThenFs => {
                 let exif_result = self.analyze_exif(path);
                 let exif_result = match exif_result {
                     Err(e) => {
@@ -311,15 +322,41 @@ impl Analyzer {
                     None => name_result?,
                 }
             }
-            AnalysisType::NameThenExif => {
+            AnalysisType::NameThenExif | AnalysisType::NameThenExifThenFs => {
                 let name_result = self.analyze_name(name)?;
                 if name_result.0.is_none() {
-                    (self.analyze_exif(path)?, name_result.1)
+                    let exif_result = self.analyze_exif(path);
+                    match exif_result {
+                        Ok(date) => (date, name_result.1),
+                        Err(e) => {
+                            warn!("Error analyzing Exif data: {} for {}", e, path.display());
+                            (None, name_result.1)
+                        }
+                    }
                 } else {
                     name_result
                 }
             }
-        })
+        };
+
+        let uses_fs_fallback = matches!(
+            self.settings.analysis_type,
+            AnalysisType::ExifThenNameThenFs | AnalysisType::NameThenExifThenFs
+        );
+        if result.0.is_none() && uses_fs_fallback {
+            info!("Falling back to filesystem date for {}", path.display());
+            match Self::analyze_fs(path) {
+                Ok(date) => return Ok((date, result.1)),
+                Err(e) => {
+                    warn!(
+                        "Error getting filesystem date: {} for {}",
+                        e,
+                        path.display()
+                    );
+                }
+            }
+        }
+        Ok(result)
     }
 
     /// Replaces {name}, {date}, ... in a format with actual values
@@ -1196,6 +1233,161 @@ mod tests {
         assert!(
             fs::read_dir(&nodate_dir).unwrap().count() > 0,
             "nodate directory should contain the file"
+        );
+    }
+
+    // ============================================================================
+    // AnalysisType parsing tests
+    // ============================================================================
+
+    #[test]
+    fn test_analysis_type_from_str_fs_fallback_modes() {
+        // Test parsing of the new fs fallback analysis modes
+        assert_eq!(
+            AnalysisType::from_str("exif_then_name_then_fs").unwrap(),
+            AnalysisType::ExifThenNameThenFs
+        );
+        assert_eq!(
+            AnalysisType::from_str("exif_name_fs").unwrap(),
+            AnalysisType::ExifThenNameThenFs
+        );
+        assert_eq!(
+            AnalysisType::from_str("name_then_exif_then_fs").unwrap(),
+            AnalysisType::NameThenExifThenFs
+        );
+        assert_eq!(
+            AnalysisType::from_str("name_exif_fs").unwrap(),
+            AnalysisType::NameThenExifThenFs
+        );
+        // Test case insensitivity
+        assert_eq!(
+            AnalysisType::from_str("EXIF_THEN_NAME_THEN_FS").unwrap(),
+            AnalysisType::ExifThenNameThenFs
+        );
+    }
+
+    // ============================================================================
+    // Filesystem date fallback tests
+    // ============================================================================
+
+    #[test]
+    fn test_exif_then_name_then_fs_uses_filesystem_date() {
+        // Arrange - file with no EXIF and no date in filename should fall back to fs date
+        let (_temp_dir, source_dir, target_dir) = setup_test_dirs().unwrap();
+        let no_date_file = TestImageBuilder::new()
+            .jpeg()
+            .with_directory(&source_dir)
+            .with_filename("random_photo.jpg")
+            .build()
+            .unwrap();
+        let analyzer = create_analyzer(
+            vec![source_dir],
+            target_dir.clone(),
+            AnalysisType::ExifThenNameThenFs,
+            ActionMode::Execute(ActualAction::Copy),
+        );
+
+        // Act
+        analyzer.run_file(&no_date_file, &None).unwrap();
+
+        // Assert - file should NOT be in nodate folder since fs date is used
+        let nodate_dir = target_dir.join("nodate");
+        let nodate_has_files = nodate_dir.exists()
+            && fs::read_dir(&nodate_dir)
+                .map(|rd| rd.count() > 0)
+                .unwrap_or(false);
+        assert!(
+            !nodate_has_files,
+            "File should be sorted by filesystem date, not placed in nodate"
+        );
+    }
+
+    #[test]
+    fn test_name_then_exif_then_fs_uses_filesystem_date() {
+        // Arrange - file with no date in filename and no EXIF should fall back to fs date
+        // Use PNG since it doesn't have EXIF, avoiding the EXIF parsing error
+        let (_temp_dir, source_dir, target_dir) = setup_test_dirs().unwrap();
+        let no_date_file = TestImageBuilder::new()
+            .png()
+            .with_directory(&source_dir)
+            .with_filename("screenshot.png")
+            .build()
+            .unwrap();
+        let analyzer = create_analyzer(
+            vec![source_dir],
+            target_dir.clone(),
+            AnalysisType::NameThenExifThenFs,
+            ActionMode::Execute(ActualAction::Copy),
+        );
+
+        // Act
+        analyzer.run_file(&no_date_file, &None).unwrap();
+
+        // Assert - file should NOT be in nodate folder since fs date is used
+        let nodate_dir = target_dir.join("nodate");
+        let nodate_has_files = nodate_dir.exists()
+            && fs::read_dir(&nodate_dir)
+                .map(|rd| rd.count() > 0)
+                .unwrap_or(false);
+        assert!(
+            !nodate_has_files,
+            "File should be sorted by filesystem date, not placed in nodate"
+        );
+    }
+
+    #[test]
+    fn test_exif_then_name_then_fs_prefers_exif() {
+        // Arrange - file with EXIF date should use EXIF, not fall back to fs
+        let (_temp_dir, source_dir, target_dir) = setup_test_dirs().unwrap();
+        let exif_date = get_datetime(2024, 3, 15, 10, 30, 0);
+        let with_exif = TestImageBuilder::new()
+            .jpeg()
+            .with_exif_datetime(exif_date)
+            .with_directory(&source_dir)
+            .with_filename("photo.jpg")
+            .build()
+            .unwrap();
+        let analyzer = create_analyzer(
+            vec![source_dir],
+            target_dir.clone(),
+            AnalysisType::ExifThenNameThenFs,
+            ActionMode::Execute(ActualAction::Copy),
+        );
+
+        // Act
+        analyzer.run_file(&with_exif, &None).unwrap();
+
+        // Assert - should be sorted by EXIF date (March 2024)
+        assert!(
+            target_dir.join("2024/03").exists(),
+            "File should be sorted by EXIF date to 2024/03"
+        );
+    }
+
+    #[test]
+    fn test_name_then_exif_then_fs_prefers_name() {
+        // Arrange - file with date in filename should use that, not fall back
+        let (_temp_dir, source_dir, target_dir) = setup_test_dirs().unwrap();
+        let source_file = TestImageBuilder::new()
+            .jpeg()
+            .with_directory(&source_dir)
+            .with_filename("20241225_christmas.jpg")
+            .build()
+            .unwrap();
+        let analyzer = create_analyzer(
+            vec![source_dir],
+            target_dir.clone(),
+            AnalysisType::NameThenExifThenFs,
+            ActionMode::Execute(ActualAction::Copy),
+        );
+
+        // Act
+        analyzer.run_file(&source_file, &None).unwrap();
+
+        // Assert - should be sorted by filename date (December 2024)
+        assert!(
+            target_dir.join("2024/12").exists(),
+            "File should be sorted by filename date to 2024/12"
         );
     }
 

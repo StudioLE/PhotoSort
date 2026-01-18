@@ -91,8 +91,10 @@ struct Arguments {
     /// A comma separated list of video extensions to include in the analysis.
     #[arg(long, default_value = "mp4,mov,avi,mkv,webm", value_delimiter = ',', num_args = 0..)]
     video_extensions: Vec<String>,
-    /// The sorting mode, possible values are `name_then_exif`, `exif_then_name`, `only_name`, `only_exif`.
+    /// The sorting mode, possible values are `name_then_exif`, `exif_then_name`, `only_name`, `only_exif`,
+    /// `exif_then_name_then_fs`, `name_then_exif_then_fs`.
     /// Name analysis tries to extract the date from the file name, Exif analysis tries to extract the date from the EXIF data.
+    /// The `_then_fs` variants fall back to the file's filesystem modification date when no other date source is available.
     #[arg(short, long, default_value = "exif_then_name")]
     analysis_mode: AnalysisType,
     /// The EXIF date field to use, possible values are `modify`, `creation`, `digitized`. EXIF data contains several date fields.
