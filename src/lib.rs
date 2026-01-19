@@ -643,6 +643,9 @@ impl Analyzer {
 
 mod exifutils;
 
+#[cfg(test)]
+pub mod testing;
+
 pub struct BracketEXIFInformation {
     pub index: u32,
 }
@@ -683,4 +686,967 @@ pub fn find_files_in_source(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::action::{ActionMode, ActualAction};
+    use crate::analysis::exif2date::ExifDateType;
+    use crate::analysis::filename2date::NaiveFileNameParser;
+    use crate::analysis::name_formatters::{
+        FormatDate, FormatDuplicate, FormatExtension, FormatFileType, FormatName,
+        FormatOriginalFileName, FormatOriginalName,
+    };
+    use crate::testing::*;
+    use chrono::Datelike;
+    use std::fs;
+    use std::path::PathBuf;
+
+    /// Creates a standard analyzer with common settings for testing
+    fn create_analyzer(
+        source_dirs: Vec<PathBuf>,
+        target_dir: PathBuf,
+        analysis_type: AnalysisType,
+        action_mode: ActionMode,
+    ) -> Analyzer {
+        let settings = AnalyzerSettings {
+            analysis_type,
+            exif_date_type: ExifDateType::Creation,
+            source_dirs,
+            target_dir,
+            recursive_source: true,
+            file_format: "{date?%Y}/{date?%m}/{type}{_:date}{-:name}{-:dup}.{ext?lower}"
+                .to_string(),
+            nodate_file_format: "nodate/{type}{-:name}{-:dup}.{ext?lower}".to_string(),
+            unknown_file_format: None,
+            bracketed_file_format: None,
+            date_format: "%Y%m%d-%H%M%S".to_string(),
+            extensions: vec![
+                "jpg".to_string(),
+                "jpeg".to_string(),
+                "png".to_string(),
+                "cr2".to_string(),
+                "nef".to_string(),
+                "arw".to_string(),
+                "dng".to_string(),
+            ],
+            #[cfg(feature = "video")]
+            video_extensions: vec!["mp4".to_string(), "mov".to_string(), "avi".to_string()],
+            action_type: action_mode,
+            mkdir: true,
+        };
+
+        let mut analyzer = Analyzer::new(settings).expect("Failed to create analyzer");
+
+        // Add standard transformers and formatters
+        analyzer.add_transformer(NaiveFileNameParser::default());
+        analyzer.add_formatter(FormatDate::default());
+        analyzer.add_formatter(FormatName::default());
+        analyzer.add_formatter(FormatDuplicate::default());
+        analyzer.add_formatter(FormatExtension::default());
+        analyzer.add_formatter(FormatFileType::default());
+        analyzer.add_formatter(FormatOriginalName::default());
+        analyzer.add_formatter(FormatOriginalFileName::default());
+
+        analyzer
+    }
+
+    // ============================================================================
+    // EXIF-based sorting tests
+    // ============================================================================
+
+    #[test]
+    fn test_sort_jpeg_with_exif_date() {
+        // Arrange
+        let (_temp_dir, source_dir, target_dir) = setup_test_dirs().unwrap();
+        let datetime = get_datetime(2024, 6, 15, 14, 30, 45);
+        let source_file = TestImageBuilder::new()
+            .jpeg()
+            .with_exif_datetime(datetime)
+            .with_directory(&source_dir)
+            .with_filename("photo.jpg")
+            .build()
+            .unwrap();
+        let analyzer = create_analyzer(
+            vec![source_dir],
+            target_dir.clone(),
+            AnalysisType::OnlyExif,
+            ActionMode::Execute(ActualAction::Copy),
+        );
+
+        // Act
+        analyzer.run_file(&source_file, &None).unwrap();
+
+        // Assert
+        let expected_path = target_dir.join("2024/06/IMG_20240615-143045-photo.jpg");
+        assert!(
+            expected_path.exists(),
+            "Expected file at: {}",
+            expected_path.display()
+        );
+    }
+
+    #[test]
+    fn test_sort_multiple_jpegs_with_different_exif_dates() {
+        // Arrange
+        let (_temp_dir, source_dir, target_dir) = setup_test_dirs().unwrap();
+        let dates = [
+            (get_datetime(2023, 1, 15, 10, 0, 0), "photo1.jpg"),
+            (get_datetime(2023, 6, 20, 15, 30, 0), "photo2.jpg"),
+            (get_datetime(2024, 12, 25, 18, 0, 0), "photo3.jpg"),
+        ];
+        for (datetime, filename) in &dates {
+            TestImageBuilder::new()
+                .jpeg()
+                .with_exif_datetime(*datetime)
+                .with_directory(&source_dir)
+                .with_filename(filename)
+                .build()
+                .unwrap();
+        }
+        let analyzer = create_analyzer(
+            vec![source_dir.clone()],
+            target_dir.clone(),
+            AnalysisType::OnlyExif,
+            ActionMode::Execute(ActualAction::Copy),
+        );
+
+        // Act
+        let mut files = Vec::new();
+        find_files_in_source(source_dir, false, &mut files).unwrap();
+        for file in files {
+            analyzer.run_file(&file, &None).unwrap();
+        }
+
+        // Assert
+        assert!(target_dir
+            .join("2023/01/IMG_20230115-100000-photo1.jpg")
+            .exists());
+        assert!(target_dir
+            .join("2023/06/IMG_20230620-153000-photo2.jpg")
+            .exists());
+        assert!(target_dir
+            .join("2024/12/IMG_20241225-180000-photo3.jpg")
+            .exists());
+    }
+
+    #[test]
+    fn test_exif_date_types() {
+        // Arrange
+        let (_temp_dir, source_dir, target_dir) = setup_test_dirs().unwrap();
+        let datetime = get_datetime(2024, 3, 10, 12, 0, 0);
+        let source_file = TestImageBuilder::new()
+            .jpeg()
+            .with_exif_datetime(datetime)
+            .with_directory(&source_dir)
+            .with_filename("test_creation.jpg")
+            .build()
+            .unwrap();
+        let settings = AnalyzerSettings {
+            analysis_type: AnalysisType::OnlyExif,
+            exif_date_type: ExifDateType::Creation,
+            source_dirs: vec![source_dir],
+            target_dir: target_dir.clone(),
+            recursive_source: false,
+            file_format: "{date}.{ext?lower}".to_string(),
+            nodate_file_format: "nodate/{name}.{ext?lower}".to_string(),
+            unknown_file_format: None,
+            bracketed_file_format: None,
+            date_format: "%Y%m%d".to_string(),
+            extensions: vec!["jpg".to_string()],
+            #[cfg(feature = "video")]
+            video_extensions: vec![],
+            action_type: ActionMode::Execute(ActualAction::Copy),
+            mkdir: true,
+        };
+        let mut analyzer = Analyzer::new(settings).unwrap();
+        analyzer.add_transformer(NaiveFileNameParser::default());
+        analyzer.add_formatter(FormatDate::default());
+        analyzer.add_formatter(FormatName::default());
+        analyzer.add_formatter(FormatDuplicate::default());
+        analyzer.add_formatter(FormatExtension::default());
+
+        // Act
+        analyzer.run_file(&source_file, &None).unwrap();
+
+        // Assert
+        assert!(target_dir.join("20240310.jpg").exists());
+    }
+
+    // ============================================================================
+    // Filename-based sorting tests
+    // ============================================================================
+
+    #[test]
+    fn test_sort_by_filename_date() {
+        // Arrange
+        let (_temp_dir, source_dir, target_dir) = setup_test_dirs().unwrap();
+        let source_file = TestImageBuilder::new()
+            .jpeg()
+            .with_directory(&source_dir)
+            .with_filename("20240815_143022_vacation.jpg")
+            .build()
+            .unwrap();
+        let analyzer = create_analyzer(
+            vec![source_dir],
+            target_dir.clone(),
+            AnalysisType::OnlyName,
+            ActionMode::Execute(ActualAction::Copy),
+        );
+
+        // Act
+        analyzer.run_file(&source_file, &None).unwrap();
+
+        // Assert
+        let expected_path = target_dir.join("2024/08/IMG_20240815-143022-vacation.jpg");
+        assert!(
+            expected_path.exists(),
+            "Expected file at: {}",
+            expected_path.display()
+        );
+    }
+
+    #[test]
+    fn test_filename_date_formats() {
+        // Arrange
+        let (_temp_dir, source_dir, target_dir) = setup_test_dirs().unwrap();
+        let filenames = [
+            "2024-01-15-photo.jpg",
+            "2024_02_20_trip.jpg",
+            "20240315_sunset.jpg",
+            "2024-04-10_12-30-45_event.jpg",
+            "IMG_20240505_183000.jpg",
+        ];
+        for filename in &filenames {
+            TestImageBuilder::new()
+                .jpeg()
+                .with_directory(&source_dir)
+                .with_filename(filename)
+                .build()
+                .unwrap();
+        }
+        let analyzer = create_analyzer(
+            vec![source_dir.clone()],
+            target_dir.clone(),
+            AnalysisType::OnlyName,
+            ActionMode::Execute(ActualAction::Copy),
+        );
+
+        // Act
+        let mut files = Vec::new();
+        find_files_in_source(source_dir, false, &mut files).unwrap();
+        for file in files {
+            analyzer.run_file(&file, &None).unwrap();
+        }
+
+        // Assert
+        assert!(target_dir.join("2024/01").exists());
+        assert!(target_dir.join("2024/02").exists());
+        assert!(target_dir.join("2024/03").exists());
+        assert!(target_dir.join("2024/04").exists());
+        assert!(target_dir.join("2024/05").exists());
+    }
+
+    #[test]
+    fn test_raw_file_filename_sorting() {
+        // Arrange
+        let (_temp_dir, source_dir, target_dir) = setup_test_dirs().unwrap();
+        let raw_files = [
+            ("20240101_120000_DSC0001.cr2", "2024/01"),
+            ("2024-02-15_landscape.nef", "2024/02"),
+            ("20240320-091500.arw", "2024/03"),
+            ("2024_04_25_portrait.dng", "2024/04"),
+        ];
+        for (filename, _) in &raw_files {
+            TestFileBuilder::new()
+                .raw()
+                .with_directory(&source_dir)
+                .with_filename(filename)
+                .build()
+                .unwrap();
+        }
+        let analyzer = create_analyzer(
+            vec![source_dir.clone()],
+            target_dir.clone(),
+            AnalysisType::OnlyName,
+            ActionMode::Execute(ActualAction::Copy),
+        );
+
+        // Act
+        let mut files = Vec::new();
+        find_files_in_source(source_dir, false, &mut files).unwrap();
+        for file in files {
+            analyzer.run_file(&file, &None).unwrap();
+        }
+
+        // Assert
+        for (_, expected_dir) in &raw_files {
+            let dir_path = target_dir.join(expected_dir);
+            assert!(
+                dir_path.exists(),
+                "Expected directory: {}",
+                dir_path.display()
+            );
+            assert!(
+                fs::read_dir(&dir_path).unwrap().count() > 0,
+                "Directory should not be empty: {}",
+                dir_path.display()
+            );
+        }
+    }
+
+    // ============================================================================
+    // Fallback behavior tests
+    // ============================================================================
+
+    #[test]
+    fn test_exif_then_name_fallback() {
+        // Arrange
+        let (_temp_dir, source_dir, target_dir) = setup_test_dirs().unwrap();
+        let exif_date = get_datetime(2024, 7, 4, 10, 0, 0);
+        let with_exif = TestImageBuilder::new()
+            .jpeg()
+            .with_exif_datetime(exif_date)
+            .with_directory(&source_dir)
+            .with_filename("with_exif.jpg")
+            .build()
+            .unwrap();
+        let without_exif = TestImageBuilder::new()
+            .jpeg()
+            .with_directory(&source_dir)
+            .with_filename("20240815_no_exif.jpg")
+            .build()
+            .unwrap();
+        let analyzer = create_analyzer(
+            vec![source_dir],
+            target_dir.clone(),
+            AnalysisType::ExifThenName,
+            ActionMode::Execute(ActualAction::Copy),
+        );
+
+        // Act
+        analyzer.run_file(&with_exif, &None).unwrap();
+        analyzer.run_file(&without_exif, &None).unwrap();
+
+        // Assert
+        assert!(target_dir.join("2024/07").exists()); // EXIF file in July
+        assert!(target_dir.join("2024/08").exists()); // Filename-based file in August
+    }
+
+    #[test]
+    fn test_name_then_exif_fallback() {
+        // Arrange
+        let (_temp_dir, source_dir, target_dir) = setup_test_dirs().unwrap();
+        let exif_date = get_datetime(2024, 1, 1, 0, 0, 0);
+        let both = TestImageBuilder::new()
+            .jpeg()
+            .with_exif_datetime(exif_date)
+            .with_directory(&source_dir)
+            .with_filename("20240615_has_both.jpg")
+            .build()
+            .unwrap();
+        let exif_only_date = get_datetime(2024, 9, 1, 12, 0, 0);
+        let exif_only = TestImageBuilder::new()
+            .jpeg()
+            .with_exif_datetime(exif_only_date)
+            .with_directory(&source_dir)
+            .with_filename("no_date_in_name.jpg")
+            .build()
+            .unwrap();
+        let analyzer = create_analyzer(
+            vec![source_dir],
+            target_dir.clone(),
+            AnalysisType::NameThenExif,
+            ActionMode::Execute(ActualAction::Copy),
+        );
+
+        // Act
+        analyzer.run_file(&both, &None).unwrap();
+        analyzer.run_file(&exif_only, &None).unwrap();
+
+        // Assert
+        assert!(target_dir.join("2024/06").exists()); // Filename date (June)
+        assert!(target_dir.join("2024/09").exists()); // EXIF date (September)
+    }
+
+    #[test]
+    fn test_no_date_handling() {
+        // Arrange
+        let (_temp_dir, source_dir, target_dir) = setup_test_dirs().unwrap();
+        let no_date_file = TestImageBuilder::new()
+            .jpeg()
+            .with_directory(&source_dir)
+            .with_filename("random_photo.jpg")
+            .build()
+            .unwrap();
+        let analyzer = create_analyzer(
+            vec![source_dir],
+            target_dir.clone(),
+            AnalysisType::ExifThenName,
+            ActionMode::Execute(ActualAction::Copy),
+        );
+
+        // Act
+        analyzer.run_file(&no_date_file, &None).unwrap();
+
+        // Assert
+        let nodate_dir = target_dir.join("nodate");
+        assert!(nodate_dir.exists(), "nodate directory should exist");
+        assert!(
+            fs::read_dir(&nodate_dir).unwrap().count() > 0,
+            "nodate directory should contain the file"
+        );
+    }
+
+    // ============================================================================
+    // Deduplication tests
+    // ============================================================================
+
+    #[test]
+    fn test_duplicate_handling() {
+        // Arrange
+        let (_temp_dir, source_dir, target_dir) = setup_test_dirs().unwrap();
+        let datetime = get_datetime(2024, 5, 1, 9, 0, 0);
+        for i in 1..=3 {
+            TestImageBuilder::new()
+                .jpeg()
+                .with_exif_datetime(datetime)
+                .with_directory(&source_dir)
+                .with_filename(&format!("photo{i}.jpg"))
+                .build()
+                .unwrap();
+        }
+        let analyzer = create_analyzer(
+            vec![source_dir.clone()],
+            target_dir.clone(),
+            AnalysisType::OnlyExif,
+            ActionMode::Execute(ActualAction::Copy),
+        );
+
+        // Act
+        let mut files = Vec::new();
+        find_files_in_source(source_dir, false, &mut files).unwrap();
+        for file in files {
+            analyzer.run_file(&file, &None).unwrap();
+        }
+
+        // Assert
+        let target_month_dir = target_dir.join("2024/05");
+        let file_count = fs::read_dir(&target_month_dir)
+            .unwrap()
+            .filter(|e| e.is_ok())
+            .count();
+        assert_eq!(
+            file_count, 3,
+            "All 3 files should be present with deduplication"
+        );
+    }
+
+    // ============================================================================
+    // Recursive directory tests
+    // ============================================================================
+
+    #[test]
+    fn test_recursive_source_directory() {
+        // Arrange
+        let (_temp_dir, source_dir, target_dir) = setup_test_dirs().unwrap();
+        let subdir1 = source_dir.join("vacation/2024");
+        let subdir2 = source_dir.join("work/meetings");
+        fs::create_dir_all(&subdir1).unwrap();
+        fs::create_dir_all(&subdir2).unwrap();
+        let date1 = get_datetime(2024, 7, 15, 10, 0, 0);
+        let date2 = get_datetime(2024, 8, 20, 14, 0, 0);
+        let date3 = get_datetime(2024, 9, 5, 9, 0, 0);
+        TestImageBuilder::new()
+            .jpeg()
+            .with_exif_datetime(date1)
+            .with_directory(&source_dir)
+            .with_filename("root_photo.jpg")
+            .build()
+            .unwrap();
+        TestImageBuilder::new()
+            .jpeg()
+            .with_exif_datetime(date2)
+            .with_directory(&subdir1)
+            .with_filename("vacation_photo.jpg")
+            .build()
+            .unwrap();
+        TestImageBuilder::new()
+            .jpeg()
+            .with_exif_datetime(date3)
+            .with_directory(&subdir2)
+            .with_filename("meeting_photo.jpg")
+            .build()
+            .unwrap();
+        let analyzer = create_analyzer(
+            vec![source_dir.clone()],
+            target_dir.clone(),
+            AnalysisType::OnlyExif,
+            ActionMode::Execute(ActualAction::Copy),
+        );
+
+        // Act
+        let mut files = Vec::new();
+        find_files_in_source(source_dir, true, &mut files).unwrap();
+        assert_eq!(files.len(), 3, "Should find 3 files recursively");
+        for file in files {
+            analyzer.run_file(&file, &None).unwrap();
+        }
+
+        // Assert
+        assert!(target_dir.join("2024/07").exists());
+        assert!(target_dir.join("2024/08").exists());
+        assert!(target_dir.join("2024/09").exists());
+    }
+
+    // ============================================================================
+    // Format string tests
+    // ============================================================================
+
+    #[test]
+    fn test_custom_format_string() {
+        // Arrange
+        let (_temp_dir, source_dir, target_dir) = setup_test_dirs().unwrap();
+        let datetime = get_datetime(2024, 11, 22, 16, 45, 30);
+        let source_file = TestImageBuilder::new()
+            .jpeg()
+            .with_exif_datetime(datetime)
+            .with_directory(&source_dir)
+            .with_filename("original_name.jpg")
+            .build()
+            .unwrap();
+        let settings = AnalyzerSettings {
+            analysis_type: AnalysisType::OnlyExif,
+            exif_date_type: ExifDateType::Creation,
+            source_dirs: vec![source_dir],
+            target_dir: target_dir.clone(),
+            recursive_source: false,
+            file_format: "{date?%Y-%m-%d}/{original_filename}".to_string(),
+            nodate_file_format: "unsorted/{original_filename}".to_string(),
+            unknown_file_format: None,
+            bracketed_file_format: None,
+            date_format: "%Y%m%d-%H%M%S".to_string(),
+            extensions: vec!["jpg".to_string()],
+            #[cfg(feature = "video")]
+            video_extensions: vec![],
+            action_type: ActionMode::Execute(ActualAction::Copy),
+            mkdir: true,
+        };
+        let mut analyzer = Analyzer::new(settings).unwrap();
+        analyzer.add_transformer(NaiveFileNameParser::default());
+        analyzer.add_formatter(FormatDate::default());
+        analyzer.add_formatter(FormatName::default());
+        analyzer.add_formatter(FormatDuplicate::default());
+        analyzer.add_formatter(FormatExtension::default());
+        analyzer.add_formatter(FormatOriginalName::default());
+        analyzer.add_formatter(FormatOriginalFileName::default());
+
+        // Act
+        analyzer.run_file(&source_file, &None).unwrap();
+
+        // Assert
+        let expected_path = target_dir.join("2024-11-22/original_name.jpg");
+        assert!(
+            expected_path.exists(),
+            "Expected file at: {}",
+            expected_path.display()
+        );
+    }
+
+    #[test]
+    fn test_extension_case_handling() {
+        // Arrange
+        let (_temp_dir, source_dir, target_dir) = setup_test_dirs().unwrap();
+        let datetime = get_datetime(2024, 1, 1, 12, 0, 0);
+        let source_file = TestImageBuilder::new()
+            .jpeg()
+            .with_exif_datetime(datetime)
+            .with_directory(&source_dir)
+            .with_filename("photo.JPG")
+            .build()
+            .unwrap();
+        let settings = AnalyzerSettings {
+            analysis_type: AnalysisType::OnlyExif,
+            exif_date_type: ExifDateType::Creation,
+            source_dirs: vec![source_dir.clone()],
+            target_dir: target_dir.clone(),
+            recursive_source: false,
+            file_format: "{date}.{ext?lower}".to_string(),
+            nodate_file_format: "nodate/{name}.{ext?lower}".to_string(),
+            unknown_file_format: None,
+            bracketed_file_format: None,
+            date_format: "%Y%m%d".to_string(),
+            extensions: vec!["jpg".to_string(), "jpeg".to_string()],
+            #[cfg(feature = "video")]
+            video_extensions: vec![],
+            action_type: ActionMode::Execute(ActualAction::Copy),
+            mkdir: true,
+        };
+        let mut analyzer = Analyzer::new(settings).unwrap();
+        analyzer.add_transformer(NaiveFileNameParser::default());
+        analyzer.add_formatter(FormatDate::default());
+        analyzer.add_formatter(FormatName::default());
+        analyzer.add_formatter(FormatDuplicate::default());
+        analyzer.add_formatter(FormatExtension::default());
+
+        // Act
+        analyzer.run_file(&source_file, &None).unwrap();
+
+        // Assert
+        assert!(target_dir.join("20240101.jpg").exists());
+    }
+
+    // ============================================================================
+    // Multiple source directories tests
+    // ============================================================================
+
+    #[test]
+    fn test_multiple_source_directories() {
+        // Arrange
+        let (_temp_dir, source_dir, target_dir) = setup_test_dirs().unwrap();
+        let source1 = source_dir.join("camera1");
+        let source2 = source_dir.join("camera2");
+        fs::create_dir_all(&source1).unwrap();
+        fs::create_dir_all(&source2).unwrap();
+        let date1 = get_datetime(2024, 3, 15, 10, 0, 0);
+        let date2 = get_datetime(2024, 4, 20, 14, 0, 0);
+        TestImageBuilder::new()
+            .jpeg()
+            .with_exif_datetime(date1)
+            .with_directory(&source1)
+            .with_filename("cam1_photo.jpg")
+            .build()
+            .unwrap();
+        TestImageBuilder::new()
+            .jpeg()
+            .with_exif_datetime(date2)
+            .with_directory(&source2)
+            .with_filename("cam2_photo.jpg")
+            .build()
+            .unwrap();
+        let analyzer = create_analyzer(
+            vec![source1.clone(), source2.clone()],
+            target_dir.clone(),
+            AnalysisType::OnlyExif,
+            ActionMode::Execute(ActualAction::Copy),
+        );
+
+        // Act
+        for source in [source1, source2] {
+            let mut files = Vec::new();
+            find_files_in_source(source, false, &mut files).unwrap();
+            for file in files {
+                analyzer.run_file(&file, &None).unwrap();
+            }
+        }
+
+        // Assert
+        assert!(target_dir.join("2024/03").exists());
+        assert!(target_dir.join("2024/04").exists());
+    }
+
+    // ============================================================================
+    // Edge case tests
+    // ============================================================================
+
+    #[test]
+    fn test_file_with_spaces_in_name() {
+        // Arrange
+        let (_temp_dir, source_dir, target_dir) = setup_test_dirs().unwrap();
+        let datetime = get_datetime(2024, 6, 1, 12, 0, 0);
+        let source_file = TestImageBuilder::new()
+            .jpeg()
+            .with_exif_datetime(datetime)
+            .with_directory(&source_dir)
+            .with_filename("my vacation photo 2024.jpg")
+            .build()
+            .unwrap();
+        let analyzer = create_analyzer(
+            vec![source_dir],
+            target_dir.clone(),
+            AnalysisType::OnlyExif,
+            ActionMode::Execute(ActualAction::Copy),
+        );
+
+        // Act
+        analyzer.run_file(&source_file, &None).unwrap();
+
+        // Assert
+        assert!(target_dir.join("2024/06").exists());
+        let dir_contents: Vec<_> = fs::read_dir(target_dir.join("2024/06"))
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .collect();
+        assert_eq!(dir_contents.len(), 1);
+    }
+
+    #[test]
+    fn test_file_with_special_characters() {
+        // Arrange
+        let (_temp_dir, source_dir, target_dir) = setup_test_dirs().unwrap();
+        let datetime = get_datetime(2024, 6, 1, 12, 0, 0);
+        let source_file = TestImageBuilder::new()
+            .jpeg()
+            .with_exif_datetime(datetime)
+            .with_directory(&source_dir)
+            .with_filename("photo_with-special.chars.jpg")
+            .build()
+            .unwrap();
+        let analyzer = create_analyzer(
+            vec![source_dir],
+            target_dir.clone(),
+            AnalysisType::OnlyExif,
+            ActionMode::Execute(ActualAction::Copy),
+        );
+
+        // Act
+        analyzer.run_file(&source_file, &None).unwrap();
+
+        // Assert
+        assert!(target_dir.join("2024/06").exists());
+    }
+
+    #[test]
+    fn test_png_file_sorting() {
+        // Arrange
+        let (_temp_dir, source_dir, target_dir) = setup_test_dirs().unwrap();
+        let source_file = TestImageBuilder::new()
+            .png()
+            .with_directory(&source_dir)
+            .with_filename("20240401_screenshot.png")
+            .build()
+            .unwrap();
+        let analyzer = create_analyzer(
+            vec![source_dir],
+            target_dir.clone(),
+            AnalysisType::OnlyName,
+            ActionMode::Execute(ActualAction::Copy),
+        );
+
+        // Act
+        analyzer.run_file(&source_file, &None).unwrap();
+
+        // Assert
+        assert!(target_dir.join("2024/04").exists());
+    }
+
+    // ============================================================================
+    // Analysis result tests
+    // ============================================================================
+
+    #[test]
+    fn test_analyze_returns_correct_date_and_name() {
+        let (_temp_dir, source_dir, target_dir) = setup_test_dirs().unwrap();
+
+        let datetime = get_datetime(2024, 8, 15, 14, 30, 0);
+        let source_file = TestImageBuilder::new()
+            .jpeg()
+            .with_exif_datetime(datetime)
+            .with_directory(&source_dir)
+            .with_filename("IMG_vacation_photo.jpg")
+            .build()
+            .unwrap();
+
+        let analyzer = create_analyzer(
+            vec![source_dir],
+            target_dir,
+            AnalysisType::OnlyExif,
+            ActionMode::Execute(ActualAction::Copy),
+        );
+
+        let (date, name) = analyzer.analyze(&source_file).unwrap();
+
+        assert!(date.is_some());
+        let extracted_date = date.unwrap();
+        assert_eq!(extracted_date.date().year(), 2024);
+        assert_eq!(extracted_date.date().month(), 8);
+        assert_eq!(extracted_date.date().day(), 15);
+
+        // Name should be cleaned (IMG prefix removed, extension removed)
+        assert!(name.contains("vacation") || name.contains("photo"));
+    }
+
+    #[test]
+    fn test_analyze_filename_date_extraction() {
+        let (_temp_dir, source_dir, target_dir) = setup_test_dirs().unwrap();
+
+        let source_file = TestImageBuilder::new()
+            .jpeg()
+            .with_directory(&source_dir)
+            .with_filename("20231225_christmas.jpg")
+            .build()
+            .unwrap();
+
+        let analyzer = create_analyzer(
+            vec![source_dir],
+            target_dir,
+            AnalysisType::OnlyName,
+            ActionMode::Execute(ActualAction::Copy),
+        );
+
+        let (date, name) = analyzer.analyze(&source_file).unwrap();
+
+        assert!(date.is_some());
+        let extracted_date = date.unwrap();
+        assert_eq!(extracted_date.date().year(), 2023);
+        assert_eq!(extracted_date.date().month(), 12);
+        assert_eq!(extracted_date.date().day(), 25);
+
+        // Name should have the date part removed
+        assert!(name.contains("christmas"));
+        assert!(!name.contains("20231225"));
+    }
+
+    // ============================================================================
+    // Video file tests (only when video feature is enabled)
+    // ============================================================================
+
+    #[cfg(feature = "video")]
+    mod video_tests {
+        use super::*;
+
+        #[test]
+        fn test_video_file_sorting_by_filename() {
+            let (_temp_dir, source_dir, target_dir) = setup_test_dirs().unwrap();
+
+            // Create fake video files with dates in filenames
+            let video_files = [
+                "20240101_120000_new_year.mp4",
+                "2024-02-14_valentine.mov",
+                "20240704_fireworks.avi",
+            ];
+
+            for filename in &video_files {
+                TestFileBuilder::new()
+                    .video()
+                    .with_directory(&source_dir)
+                    .with_filename(filename)
+                    .build()
+                    .unwrap();
+            }
+
+            let settings = AnalyzerSettings {
+                analysis_type: AnalysisType::OnlyName,
+                exif_date_type: ExifDateType::Creation,
+                source_dirs: vec![source_dir.clone()],
+                target_dir: target_dir.clone(),
+                recursive_source: false,
+                file_format: "{date?%Y}/{date?%m}/{type}{_:date}{-:name}.{ext?lower}".to_string(),
+                nodate_file_format: "nodate/{type}{-:name}.{ext?lower}".to_string(),
+                unknown_file_format: None,
+                bracketed_file_format: None,
+                date_format: "%Y%m%d-%H%M%S".to_string(),
+                extensions: vec!["jpg".to_string()],
+                video_extensions: vec!["mp4".to_string(), "mov".to_string(), "avi".to_string()],
+                action_type: ActionMode::Execute(ActualAction::Copy),
+                mkdir: true,
+            };
+
+            let mut analyzer = Analyzer::new(settings).unwrap();
+            analyzer.add_transformer(NaiveFileNameParser::default());
+            analyzer.add_formatter(FormatDate::default());
+            analyzer.add_formatter(FormatName::default());
+            analyzer.add_formatter(FormatDuplicate::default());
+            analyzer.add_formatter(FormatExtension::default());
+            analyzer.add_formatter(FormatFileType::default());
+
+            let mut files = Vec::new();
+            find_files_in_source(source_dir, false, &mut files).unwrap();
+            for file in files {
+                analyzer.run_file(&file, &None).unwrap();
+            }
+
+            // Verify video files are sorted correctly
+            assert!(target_dir.join("2024/01").exists());
+            assert!(target_dir.join("2024/02").exists());
+            assert!(target_dir.join("2024/07").exists());
+        }
+    }
+
+    // ============================================================================
+    // Error handling tests
+    // ============================================================================
+
+    #[test]
+    fn test_invalid_source_directory() {
+        let target_dir = tempfile::TempDir::new().unwrap();
+
+        let settings = AnalyzerSettings {
+            analysis_type: AnalysisType::OnlyExif,
+            exif_date_type: ExifDateType::Creation,
+            source_dirs: vec![PathBuf::from("/nonexistent/directory")],
+            target_dir: target_dir.path().to_path_buf(),
+            recursive_source: false,
+            file_format: "{date}.{ext}".to_string(),
+            nodate_file_format: "nodate/{name}.{ext}".to_string(),
+            unknown_file_format: None,
+            bracketed_file_format: None,
+            date_format: "%Y%m%d".to_string(),
+            extensions: vec!["jpg".to_string()],
+            #[cfg(feature = "video")]
+            video_extensions: vec![],
+            action_type: ActionMode::Execute(ActualAction::Copy),
+            mkdir: true,
+        };
+
+        let result = Analyzer::new(settings);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_invalid_target_directory() {
+        let source_dir = tempfile::TempDir::new().unwrap();
+
+        let settings = AnalyzerSettings {
+            analysis_type: AnalysisType::OnlyExif,
+            exif_date_type: ExifDateType::Creation,
+            source_dirs: vec![source_dir.path().to_path_buf()],
+            target_dir: PathBuf::from("/nonexistent/target"),
+            recursive_source: false,
+            file_format: "{date}.{ext}".to_string(),
+            nodate_file_format: "nodate/{name}.{ext}".to_string(),
+            unknown_file_format: None,
+            bracketed_file_format: None,
+            date_format: "%Y%m%d".to_string(),
+            extensions: vec!["jpg".to_string()],
+            #[cfg(feature = "video")]
+            video_extensions: vec![],
+            action_type: ActionMode::Execute(ActualAction::Copy),
+            mkdir: true,
+        };
+
+        let result = Analyzer::new(settings);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_invalid_extension_handling() {
+        let (_temp_dir, source_dir, target_dir) = setup_test_dirs().unwrap();
+
+        // Create a file with an extension not in the list
+        let source_file = source_dir.join("document.pdf");
+        fs::write(&source_file, b"PDF content").unwrap();
+
+        let analyzer = create_analyzer(
+            vec![source_dir],
+            target_dir.clone(),
+            AnalysisType::OnlyExif,
+            ActionMode::Execute(ActualAction::Copy),
+        );
+
+        // This should not create any files (extension not valid)
+        let result = analyzer.run_file(&source_file, &None);
+        assert!(result.is_ok()); // Should succeed but skip the file
+
+        // Target should be empty (no files copied)
+        let has_files = fs::read_dir(&target_dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .any(|e| e.path().is_file());
+        assert!(
+            !has_files,
+            "No files should be copied for invalid extension"
+        );
+    }
 }
